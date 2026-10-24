@@ -17,9 +17,11 @@ class FakeStorage:
         self.record = record
         self.index = index
 
-    def _share_cuda_(self) -> tuple[int, ...]:  # noqa: leading-underscore
+    def _share_cuda_(
+        self,
+    ) -> tuple[int, bytes, int, int, str, int, bytes, bool]:  # noqa: leading-underscore
         self.record.append(self.index)
-        return (self.index,)
+        return (0, b"", 0, 0, f"/torch_fake_{self.index}", 0, b"", False)
 
 
 class FakeTensor:
@@ -43,6 +45,7 @@ def install_fake_cuda(monkeypatch: pytest.MonkeyPatch, record: list[int]) -> Non
         return FakeTensor(record, int(device.split(":")[1]))
 
     monkeypatch.setattr(stage_workers, "_cuda_ipc_warm_shares", [])
+    monkeypatch.setattr(stage_workers, "_cuda_ipc_warm_handles", [])
     monkeypatch.setattr(stage_workers.current_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(stage_workers.current_platform, "is_rocm", lambda: False)
     monkeypatch.setattr(stage_workers.torch, "empty", _empty)
@@ -85,3 +88,19 @@ def test_non_cuda_non_rocm_platform_warms_nothing(
     spec = make_spec([(0, False)])
     stage_workers.prewarm_cuda_ipc_export(spec, logging.getLogger("test"))
     assert record == []
+
+
+def test_release_unlinks_the_counter_file_and_drops_the_share(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shutdown unlinks the prewarm share's ref counter file and drops the tensor."""
+    record: list[int] = []
+    install_fake_cuda(monkeypatch, record)
+    unlinked: list[str] = []
+    monkeypatch.setattr(stage_workers.os, "unlink", lambda path: unlinked.append(path))
+    spec = make_spec([(0, False)])
+    stage_workers.prewarm_cuda_ipc_export(spec, logging.getLogger("test"))
+    stage_workers.release_cuda_ipc_warm_shares()
+    assert unlinked == ["/dev/shm/torch_fake_0"]
+    assert stage_workers._cuda_ipc_warm_shares == []  # noqa: leading-underscore
+    assert stage_workers._cuda_ipc_warm_handles == []  # noqa: leading-underscore

@@ -707,6 +707,7 @@ def report_startup_progress(spec: StageWorkerProcessSpec) -> None:
 
 # note (db-ol): held so torch cannot reset its CUDA IPC ref counter file mid export.
 _cuda_ipc_warm_shares: list[torch.Tensor] = []
+_cuda_ipc_warm_handles: list[str] = []
 
 
 def prewarm_cuda_ipc_export(spec: StageWorkerProcessSpec, log: logging.Logger) -> None:
@@ -725,9 +726,26 @@ def prewarm_cuda_ipc_export(spec: StageWorkerProcessSpec, log: logging.Logger) -
     else:
         pass
     tensor = torch.empty(1, dtype=torch.uint8, device=f"cuda:{gpu_ids[0]}")
-    tensor.untyped_storage()._share_cuda_()  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+    shared = (
+        tensor.untyped_storage()._share_cuda_()
+    )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     _cuda_ipc_warm_shares.append(tensor)
+    _cuda_ipc_warm_handles.append(shared[4])
     log.info(f"Warmed CUDA IPC on cuda:{gpu_ids[0]} before constructing stages")
+
+
+def release_cuda_ipc_warm_shares() -> None:
+    """Unlink the prewarm shares' ref counter files and drop the held tensors.
+
+    No receiver releases the prewarm slot, so ipc_collect and the teardown that
+    os._exit skips cannot remove its shared memory file. Unlink it here at shutdown,
+    before the final ipc_collect, so a worker restart does not leak one each time.
+    """
+    for handle in _cuda_ipc_warm_handles:
+        with suppress(OSError):
+            os.unlink(f"/dev/shm/{handle.lstrip('/')}")
+    _cuda_ipc_warm_handles.clear()
+    _cuda_ipc_warm_shares.clear()
 
 
 def run_process(
@@ -807,6 +825,8 @@ def run_process(
             reason=f"stage process {spec.process_name} failure",
         )
         raise
+    finally:
+        release_cuda_ipc_warm_shares()
 
 
 def cleanup_constructed_stages(
